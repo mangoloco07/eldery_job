@@ -1,27 +1,24 @@
 import streamlit as st
 import pandas as pd
 import json
+import uuid
 from google import genai
 from google.genai import types
 import firebase_admin
 from firebase_admin import credentials, firestore
 
-# firebase streamlit에 연동
-cred_dict = dict(st.secrets["firebase"])
-cred = credentials.Certificate(cred_dict)
-firebase_admin.initialize_app(cred)
+st.set_page_config(page_title="노인 일자리 매칭 도움 AI", page_icon="👵👴", layout="wide")
+
+# Firebase/Gemini 연동 
+if not firebase_admin._apps:
+    cred_dict = dict(st.secrets["firebase"])
+    cred = credentials.Certificate(cred_dict)
+    firebase_admin.initialize_app(cred)
 
 db = firestore.client()
 
-# Gemini API Key 설정
-st.set_page_config(page_title="노인 일자리 매칭 도움 AI", page_icon="👵👴", layout="wide")
-
-st.sidebar.title("🔑 API 설정")
-gemini_api_key = st.sidebar.text_input(
-    "Gemini API Key 입력", 
-    type="password", 
-    help="Google AI Studio에서 발급받은 API 키를 입력하세요."
-)
+gemini_api_key = st.secrets["GEMINI_API_KEY"]
+st.sidebar.success("✅ AI 엔진(Gemini) 연결됨")
 
 # 2026 사업분류코드 및 기본 채용 조건
 LITERACY_CODES = {"B-02", "B-09", "B-12"}
@@ -73,7 +70,7 @@ RAW_BUSINESS_DATA = [
     ("E-03", "공동체사업단", "식품제조-도시락 및 반찬류", "도시락 및 반찬류 식품 제조 및 판매"),
     ("E-04", "공동체사업단", "식품제조-기타", "기타 식품 제조 및 판매"),
     ("E-05", "공동체사업단", "공산품제작-비누류", "규격에 맞춘 비누류 공산품 제작 및 판매"),
-    ("E-06", "공동체사업단", "공산품제작-봉제제품", "봉제제품 제작 및 판매"),
+    ("E-06", "공동체사업단", "공산품제작-봉제제품", "봉제제품 제작 및 판매")
     ("E-07", "공동체사업단", "매장운영-카페", "소규모 실버 카페 매장 운영"),
     ("E-08", "공동체사업단", "매장운영-음식점", "소규모 음식점 매장 운영"),
     ("E-09", "공동체사업단", "매장운영-매점(편의점)", "소규모 매점 및 편의점 운영"),
@@ -100,7 +97,18 @@ for code, category, name, desc in RAW_BUSINESS_DATA:
         "is_hours": code in HOURS_CODES
     }
 
-# Firebase 작성/수정/삭제 함수
+# 4. 세션 초기화 
+INITIAL_CHAT = [
+    {"role": "assistant", "content": "안녕하세요, 어르신! 반갑습니다. 일자리 안내를 도와드릴 스마트 도우미입니다. 편하게 이야기 나누어요."}
+]
+
+if "chat_history" not in st.session_state:
+    st.session_state.chat_history = list(INITIAL_CHAT)
+
+if "user_id" not in st.session_state:
+    st.session_state.user_id = f"senior_{str(uuid.uuid4())[:8]}"
+
+# Firebase 읽기/쓰기/삭제 함수
 def get_jobs_from_firestore():
     docs = db.collection("db1_jobs").stream()
     jobs = []
@@ -115,20 +123,19 @@ def save_job_to_firestore(job_data):
     doc_ref.set(job_data)
 
 def delete_job_from_firestore(job_id):
-    # 공고 삭제 시 해당 공고의 선호도(b지수) 데이터도 함께 삭제
     db.collection("db1_jobs").document(job_id).delete()
     db.collection("db2_preferences").document(job_id).delete()
 
 def save_senior_profile_to_firestore(profile_data):
-    doc_ref = db.collection("db2_seniors").document("current_senior")
+    doc_ref = db.collection("db2_seniors").document(st.session_state.user_id)
     doc_ref.set(profile_data)
 
 def get_senior_profile_from_firestore():
-    doc = db.collection("db2_seniors").document("current_senior").get()
+    doc = db.collection("db2_seniors").document(st.session_state.user_id).get()
     return doc.to_dict() if doc.exists else None
 
 def delete_senior_profile_from_firestore():
-    db.collection("db2_seniors").document("current_senior").delete()
+    db.collection("db2_seniors").document(st.session_state.user_id).delete()
 
 def increment_b_index_in_firestore(job_id):
     pref_ref = db.collection("db2_preferences").document(job_id)
@@ -142,14 +149,7 @@ def get_preferences_from_firestore():
     docs = db.collection("db2_preferences").stream()
     return {doc.id: doc.to_dict() for doc in docs}
 
-# 4. 세션 초기화 및 기타 채용 조건 일치도 점수 계산
-INITIAL_CHAT = [
-    {"role": "assistant", "content": "안녕하세요, 어르신! 반갑습니다. 일자리 안내를 도와드릴 스마트 도우미입니다. 편하게 이야기 나누어요."}
-]
-
-if "chat_history" not in st.session_state:
-    st.session_state.chat_history = list(INITIAL_CHAT)
-
+# 기타 채용 조건 일치도 점수 계산 (Gemini LLM)
 def calculate_a_index_with_llm(client, senior_exps, job_extras):
     exact_matched = list(set(job_extras).intersection(set(senior_exps)))
     
@@ -197,7 +197,9 @@ user_role = st.sidebar.radio(
     ["🏢 사업주 모드", "👵 구직자 모드", "⚙️ 일자리 추천"]
 )
 
-# [1] 사업주 모드 
+# ---------------------------------------------------------
+# [1] 사업주 모드
+# ---------------------------------------------------------
 if user_role == "🏢 사업주 모드":
     st.header("🏢 사업주 전용 - 일자리 등록 및 관리")
 
@@ -281,7 +283,9 @@ if user_role == "🏢 사업주 모드":
     else:
         st.write("등록된 일자리가 없습니다.")
 
-# 구직자 모드 
+# ---------------------------------------------------------
+# [2] 구직자 모드
+# ---------------------------------------------------------
 elif user_role == "👵 구직자 모드":
     st.header("👵 어르신을 위한 챗봇")
 
@@ -370,14 +374,16 @@ elif user_role == "👵 구직자 모드":
 
         senior = get_senior_profile_from_firestore()
         if senior:
-            st.subheader("📋현재 저장된 구직자 프로필")
+            st.subheader(f"📋 현재 저장된 구직자 프로필 (`{st.session_state.user_id}`)")
             st.json(senior)
             if st.button("🗑️ 저장된 프로필 삭제하기"):
                 delete_senior_profile_from_firestore()
                 st.success("저장된 구직자 프로필이 삭제되었습니다.")
                 st.rerun()
 
-# 일자리 추천 모드 및 유사 고령자 선호도 점수 계산
+# ---------------------------------------------------------
+# [3] 일자리 추천 모드
+# ---------------------------------------------------------
 elif user_role == "⚙️ 일자리 추천":
     senior = get_senior_profile_from_firestore()
     db1_jobs = get_jobs_from_firestore()
