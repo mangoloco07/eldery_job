@@ -1,20 +1,29 @@
 import streamlit as st
 import pandas as pd
 import json
-from openai import OpenAI
+from google import genai
+from google.genai import types
+import firebase_admin
+from firebase_admin import credentials, firestore
 
+# firebase streamlit에 연동
+cred_dict = dict(st.secrets["firebase"])
+cred = credentials.Certificate(cred_dict)
+firebase_admin.initialize_app(cred)
 
-# API 설정
+db = firestore.client()
+
+# Gemini API Key 설정
 st.set_page_config(page_title="노인 일자리 매칭 도움 AI", page_icon="👵👴", layout="wide")
 
-st.sidebar.title("🔑 API 및 시스템 설정")
-openai_api_key = st.sidebar.text_input(
-    "OpenAI API Key 입력", 
+st.sidebar.title("🔑 API 설정")
+gemini_api_key = st.sidebar.text_input(
+    "Gemini API Key 입력", 
     type="password", 
-    help="sk-... 형태의 API 키를 입력하세요."
+    help="Google AI Studio에서 발급받은 API 키를 입력하세요."
 )
 
-# 사업분류코드 및 기본 채용 조건
+# 2026 사업분류코드 및 기본 채용 조건
 LITERACY_CODES = {"B-02", "B-09", "B-12"}
 WALKING_CODES = {"A-02", "A-13", "A-16", "A-18", "A-08", "B-08", "E-13", "E-14", "E-15"}
 HOURS_CODES = {f"E-0{i}" if i < 10 else f"E-{i}" for i in range(1, 13)}
@@ -53,11 +62,11 @@ RAW_BUSINESS_DATA = [
     ("B-05", "역량활용", "장애인시설 운영지원", "장애인 거주시설, 자립생활지원시설, 직업재활시설 등 운영지원"),
     ("B-06", "역량활용", "국가·지자체·공공단체 시설 운영지원", "행정복지센터, 의료시설, 치안시설, 우체국, 소방서 등 운영지원"),
     ("B-07", "역량활용", "지역 시설·기관 운영지원", "지역 내 사회적경제조직, 수요처 운영지원 및 복지 서비스 제공"),
-    ("B-08", "역량활용", "안전관리 지원 (14개)", "디지털 교통안전 도우미, 바다안전순찰대, 승강기안전단, 치안지킴이 등 안전점검"),
-    ("B-09", "역량활용", "보건관리 지원 (9개)", "건강의료서비스매니저, 디지털 헬스케어 매니저, 자살예방 상담원 등 보건증진 지원"),
-    ("B-10", "역량활용", "환경보존 지원 (3개)", "나눔자원관리, 산림자원보존사업단, 생태도슨트 등 환경보존 활동"),
-    ("B-11", "역량활용", "돌봄 지원 (12개)", "고독사예방게이트키퍼, 발달장애인 활동매니저, 온동네 초등돌봄(늘봄학교), 응급안전 지킴이 등"),
-    ("B-12", "역량활용", "국민편의 지원 (17개)", "다문화 정착지원, 공항서포터즈, 금융업무지원, 연금가이드, 점자 도우미 등 서비스 안내"),
+    ("B-08", "역량활용", "안전관리 지원", "디지털 교통안전 도우미, 바다안전순찰대, 승강기안전단, 치안지킴이 등 안전점검"),
+    ("B-09", "역량활용", "보건관리 지원", "건강의료서비스매니저, 디지털 헬스케어 매니저, 자살예방 상담원 등 보건증진 지원"),
+    ("B-10", "역량활용", "환경보존 지원", "나눔자원관리, 산림자원보존사업단, 생태도슨트 등 환경보존 활동"),
+    ("B-11", "역량활용", "돌봄 지원", "고독사예방게이트키퍼, 발달장애인 활동매니저, 온동네 초등돌봄(늘봄학교), 응급안전 지킴이 등"),
+    ("B-12", "역량활용", "국민편의 지원", "다문화 정착지원, 공항서포터즈, 금융업무지원, 연금가이드, 점자 도우미 등 서비스 안내"),
 
     ("E-01", "공동체사업단", "식품제조-간식류", "식재료를 활용하여 간식류 식품 제조 및 판매"),
     ("E-02", "공동체사업단", "식품제조-참기름 및 장류", "참기름, 장류 등 식품 제조 및 판매"),
@@ -91,27 +100,57 @@ for code, category, name, desc in RAW_BUSINESS_DATA:
         "is_hours": code in HOURS_CODES
     }
 
-# 세션 
-if "db1_jobs" not in st.session_state:
-    st.session_state.db1_jobs = []
+# Firebase 작성/수정/삭제 함수
+def get_jobs_from_firestore():
+    docs = db.collection("db1_jobs").stream()
+    jobs = []
+    for doc in docs:
+        d = doc.to_dict()
+        d["id"] = doc.id
+        jobs.append(d)
+    return sorted(jobs, key=lambda x: x.get("id", ""))
+
+def save_job_to_firestore(job_data):
+    doc_ref = db.collection("db1_jobs").document(job_data["id"])
+    doc_ref.set(job_data)
+
+def delete_job_from_firestore(job_id):
+    # 공고 삭제 시 해당 공고의 선호도(b지수) 데이터도 함께 삭제
+    db.collection("db1_jobs").document(job_id).delete()
+    db.collection("db2_preferences").document(job_id).delete()
+
+def save_senior_profile_to_firestore(profile_data):
+    doc_ref = db.collection("db2_seniors").document("current_senior")
+    doc_ref.set(profile_data)
+
+def get_senior_profile_from_firestore():
+    doc = db.collection("db2_seniors").document("current_senior").get()
+    return doc.to_dict() if doc.exists else None
+
+def delete_senior_profile_from_firestore():
+    db.collection("db2_seniors").document("current_senior").delete()
+
+def increment_b_index_in_firestore(job_id):
+    pref_ref = db.collection("db2_preferences").document(job_id)
+    doc = pref_ref.get()
+    if doc.exists:
+        pref_ref.update({"select_count": firestore.Increment(1)})
+    else:
+        pref_ref.set({"select_count": 1})
+
+def get_preferences_from_firestore():
+    docs = db.collection("db2_preferences").stream()
+    return {doc.id: doc.to_dict() for doc in docs}
+
+# 4. 세션 초기화 및 기타 채용 조건 일치도 점수 계산
+INITIAL_CHAT = [
+    {"role": "assistant", "content": "안녕하세요, 어르신! 반갑습니다. 일자리 안내를 도와드릴 스마트 도우미입니다. 편하게 이야기 나누어요."}
+]
 
 if "chat_history" not in st.session_state:
-    st.session_state.chat_history = [
-        {"role": "assistant", "content": "안녕하세요, 어르신! 반갑습니다. 일자리 안내를 도와드릴 스마트 도우미입니다. 편하게 이야기 나누어요."}
-    ]
+    st.session_state.chat_history = list(INITIAL_CHAT)
 
-if "senior_db2" not in st.session_state:
-    st.session_state.senior_db2 = None
-
-if "db2_preferences" not in st.session_state:
-    st.session_state.db2_preferences = {}
-
-# 기타 채용 조건과의 일치도 점수 
 def calculate_a_index_with_llm(client, senior_exps, job_extras):
-    """
-    단순 키워드 일치를 넘어 의미상 연관성(예: '요리'↔'조리', '택배'↔'배달')을
-    분석하고 a지수 점수(50~100점) 및 매칭 근거를 반환합니다.
-    """
     exact_matched = list(set(job_extras).intersection(set(senior_exps)))
     
     if not job_extras:
@@ -137,13 +176,15 @@ def calculate_a_index_with_llm(client, senior_exps, job_extras):
             '{"score": 85, "matched_reasons": ["요리 ↔ 조리 (연관 인정)"]}'
         )
 
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role": "user", "content": prompt}],
-            response_format={"type": "json_object"},
-            temperature=0.0
+        response = client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=prompt,
+            config=types.GenerateContentConfig(
+                response_mime_type="application/json",
+                temperature=0.0
+            )
         )
-        res = json.loads(response.choices[0].message.content)
+        res = json.loads(response.text)
         return float(res.get("score", 50)), res.get("matched_reasons", exact_matched)
     except Exception:
         score = min(50 + len(exact_matched) * 25, 100)
@@ -156,9 +197,9 @@ user_role = st.sidebar.radio(
     ["🏢 사업주 모드", "👵 구직자 모드", "⚙️ 일자리 추천"]
 )
 
-# [1] 사업주 모드: 일자리 등록
+# [1] 사업주 모드 
 if user_role == "🏢 사업주 모드":
-    st.header("🏢 사업주 전용 - 일자리 등록")
+    st.header("🏢 사업주 전용 - 일자리 등록 및 관리")
 
     with st.form("employer_form"):
         col1, col2 = st.columns(2)
@@ -185,8 +226,19 @@ if user_role == "🏢 사업주 모드":
 
         submit = st.form_submit_button("등록")
         if submit:
+            existing_jobs = get_jobs_from_firestore()
+            max_num = 0
+            for j in existing_jobs:
+                try:
+                    num = int(j["id"].split("-")[-1])
+                    if num > max_num:
+                        max_num = num
+                except ValueError:
+                    pass
+            new_job_id = f"JOB-2026-{max_num + 1:02d}"
+            
             new_job = {
-                "id": f"JOB-2026-0{len(st.session_state.db1_jobs) + 1}",
+                "id": new_job_id,
                 "company_name": comp_name,
                 "title": title,
                 "code": code_sel,
@@ -198,23 +250,45 @@ if user_role == "🏢 사업주 모드":
                 "is_hours": is_h,
                 "extra_conditions": [x.strip() for x in extra_conds.split(",") if x.strip()]
             }
-            st.session_state.db1_jobs.append(new_job)
-            st.success("일자리가 성공적으로 등록되었습니다.")
+            save_job_to_firestore(new_job)
+            st.success(f"✅ 일자리가 등록되었습니다. (ID: {new_job_id})")
+            st.rerun()
 
     st.subheader("📋 현재 등록된 일자리")
-    if st.session_state.db1_jobs:
-        st.dataframe(pd.DataFrame(st.session_state.db1_jobs), use_container_width=True)
+    db1_jobs = get_jobs_from_firestore()
+    if db1_jobs:
+        st.dataframe(pd.DataFrame(db1_jobs), use_container_width=True)
+
+        st.divider()
+        st.subheader("🗑️ 일자리 삭제")
+        job_options = {
+            j["id"]: f"[{j['id']}] {j.get('title', '제목없음')} - {j.get('company_name', '')} ({j.get('region_sigungu', '')})"
+            for j in db1_jobs
+        }
+        del_col1, del_col2 = st.columns([3, 1])
+        with del_col1:
+            selected_job_id = st.selectbox(
+                "삭제할 일자리 선택",
+                options=list(job_options.keys()),
+                format_func=lambda x: job_options[x],
+                label_visibility="collapsed"
+            )
+        with del_col2:
+            if st.button("🗑️ 선택한 일자리 삭제", use_container_width=True):
+                delete_job_from_firestore(selected_job_id)
+                st.success(f"일자리({selected_job_id})가 삭제되었습니다.")
+                st.rerun()
     else:
         st.write("등록된 일자리가 없습니다.")
 
-# [2] 구직자 모드: 구직자 프로필 저장
+# 구직자 모드 
 elif user_role == "👵 구직자 모드":
     st.header("👵 어르신을 위한 챗봇")
 
-    if not openai_api_key:
-        st.warning("⚠️ 사이드바에 OpenAI API Key를 먼저 입력해 주세요.")
+    if not gemini_api_key:
+        st.warning("⚠️ 사이드바에 Gemini API Key를 먼저 입력해 주세요.")
     else:
-        client = OpenAI(api_key=openai_api_key)
+        client = genai.Client(api_key=gemini_api_key)
 
         for msg in st.session_state.chat_history:
             st.chat_message(msg["role"]).write(msg["content"])
@@ -229,21 +303,40 @@ elif user_role == "👵 구직자 모드":
                 "(4)희망 임금 및 시간, (5)과거 직업 경험 및 잘하는 일을 자연스럽게 여쭈어보고 다정하게 호응해 주세요."
             )
 
-            messages = [{"role": "system", "content": system_prompt}] + st.session_state.chat_history
-            
+            contents = []
+            for msg in st.session_state.chat_history:
+                role = "model" if msg["role"] == "assistant" else "user"
+                contents.append(types.Content(role=role, parts=[types.Part.from_text(text=msg["content"])]))
+
             with st.chat_message("assistant"):
-                response = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=messages,
-                    temperature=0.7
-                )
-                bot_reply = response.choices[0].message.content
-                st.write(bot_reply)
-                st.session_state.chat_history.append({"role": "assistant", "content": bot_reply})
+                try:
+                    response = client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=contents,
+                        config=types.GenerateContentConfig(
+                            system_instruction=system_prompt,
+                            temperature=0.7
+                        )
+                    )
+                    bot_reply = response.text
+                    st.write(bot_reply)
+                    st.session_state.chat_history.append({"role": "assistant", "content": bot_reply})
+                except Exception as e:
+                    st.error(f"⚠️ Gemini API 오류가 발생했습니다: {e}")
 
         st.divider()
 
-        if st.button("내 일자리 프로필 저장하기"):
+        btn_col1, btn_col2 = st.columns(2)
+        with btn_col1:
+            save_clicked = st.button("💾 내 일자리 프로필 저장하기", use_container_width=True)
+        with btn_col2:
+            reset_chat_clicked = st.button("🔄 대화 내역 초기화", use_container_width=True)
+
+        if reset_chat_clicked:
+            st.session_state.chat_history = list(INITIAL_CHAT)
+            st.rerun()
+
+        if save_clicked:
             with st.spinner("대화를 정밀 분석 중입니다..."):
                 parse_prompt = (
                     "다음 대화 내역 전체를 분석하여 구직자의 프로필을 JSON 형식으로만 파싱해 주세요.\n"
@@ -259,37 +352,49 @@ elif user_role == "👵 구직자 모드":
                     f"대화 내역:\n{json.dumps(st.session_state.chat_history, ensure_ascii=False)}"
                 )
 
-                parse_response = client.chat.completions.create(
-                    model="gpt-4o-mini",
-                    messages=[{"role": "user", "content": parse_prompt}],
-                    response_format={"type": "json_object"},
-                    temperature=0.0
-                )
+                try:
+                    parse_response = client.models.generate_content(
+                        model="gemini-2.5-flash",
+                        contents=parse_prompt,
+                        config=types.GenerateContentConfig(
+                            response_mime_type="application/json",
+                            temperature=0.0
+                        )
+                    )
 
-                parsed_json = json.loads(parse_response.choices[0].message.content)
-                st.session_state.senior_db2 = parsed_json
-                st.success("프로필을 성공적으로 저장했습니다.")
+                    parsed_json = json.loads(parse_response.text)
+                    save_senior_profile_to_firestore(parsed_json)
+                    st.success("✅ 구직자 프로필이 저장되었습니다.")
+                except Exception as e:
+                    st.error(f"⚠️ 프로필 분석 중 오류가 발생했습니다: {e}")
 
-        if st.session_state.senior_db2:
-            st.subheader("구직자 프로필")
-            st.json(st.session_state.senior_db2)
+        senior = get_senior_profile_from_firestore()
+        if senior:
+            st.subheader("📋현재 저장된 구직자 프로필")
+            st.json(senior)
+            if st.button("🗑️ 저장된 프로필 삭제하기"):
+                delete_senior_profile_from_firestore()
+                st.success("저장된 구직자 프로필이 삭제되었습니다.")
+                st.rerun()
 
-# 맞는 일자리 찾기 
-elif user_role == "⚙️ 일자리 추":
-    senior = st.session_state.senior_db2
+# 일자리 추천 모드 및 유사 고령자 선호도 점수 계산
+elif user_role == "⚙️ 일자리 추천":
+    senior = get_senior_profile_from_firestore()
+    db1_jobs = get_jobs_from_firestore()
+
     if not senior:
         st.warning("⚠️ '👵 구직자 모드' 탭에서 프로필을 먼저 저장해 주세요.")
-    elif not st.session_state.db1_jobs:
+    elif not db1_jobs:
         st.warning("⚠️ '🏢 사업주 모드' 탭에서 일자리를 먼저 등록해 주세요.")
     else:
-        # Client 인스턴스 준비
-        client = OpenAI(api_key=openai_api_key) if openai_api_key else None
+        client = genai.Client(api_key=gemini_api_key) if gemini_api_key else None
+        db2_prefs = get_preferences_from_firestore()
 
         # [하드필터링]
         passed_jobs = []
         failed_jobs = []
 
-        for j in st.session_state.db1_jobs:
+        for j in db1_jobs:
             reasons = []
             if j.get("region_sigungu") != senior.get("region_sigungu"):
                 reasons.append(f"지역 불일치 ({j.get('region_sigungu')} ≠ {senior.get('region_sigungu')})")
@@ -299,7 +404,7 @@ elif user_role == "⚙️ 일자리 추":
                 reasons.append("기초문해력 미달")
             if j.get("is_hours") and not senior.get("can_hours", False):
                 reasons.append("장시간근무 미달")
-            if j.get("pay", 0) < senior.get("target_pay", 0) * 0.8:
+            if j.get("pay", 0) < (senior.get("target_pay") or 0) * 0.8:
                 reasons.append("희망임금 미달")
 
             if reasons:
@@ -311,20 +416,17 @@ elif user_role == "⚙️ 일자리 추":
         st.divider()
         scored_list = []
 
-        with st.spinner("실시간 분석 중입니다..."):
+        with st.spinner("Firebase DB 데이터와 Gemini LLM을 통해 실시간 분석 중입니다..."):
             for j in passed_jobs:
-                # [기타 채용 조건과의 일치도 점수]
                 job_extras = j.get("extra_conditions", [])
-                senior_exps = senior.get("experiences", [])
+                senior_exps = senior.get("experiences") or []
                 
                 a_index, matched_reasons = calculate_a_index_with_llm(client, senior_exps, job_extras)
 
-                # [이전 유사 고령자의 선호도 점수]
-                pref_data = st.session_state.db2_preferences.get(j["id"], {"select_count": 0})
-                select_cnt = pref_data["select_count"]
+                pref_data = db2_prefs.get(j["id"], {"select_count": 0})
+                select_cnt = pref_data.get("select_count", 0)
                 b_index = min(select_cnt * 10, 100)  
 
-                # 최종 점수 합산 
                 if select_cnt == 0:
                     final_score = float(a_index) 
                     weight_info = "a지수 100% (최초)"
@@ -341,26 +443,20 @@ elif user_role == "⚙️ 일자리 추":
                     "matched": matched_reasons
                 })
 
-        # 추천 순위 정렬
         scored_list.sort(key=lambda x: x["final_score"], reverse=True)
 
         st.subheader("🏆 맘에 드는 일자리 순위")
         
-        for rank, item in enumerate(scored_list, 1):
-            j = item["job"]
-            with st.expander(f"✨ [{rank}위] {j['title']} (최종 점수: {item['final_score']:.1f}점)", expanded=True):
-                st.write(f"- **사업체명**: {j['company_name']} | **사업코드**: `{j['code']}`")
-                st.write(f"- **a지수 (LLM 역량 의미일치도)**: **{item['a_index']:.1f}점** (매칭 판단: `{', '.join(item['matched'])}`)")
-                st.write(f"- **b지수 (유사 구직자 선호도)**: **{item['b_index']}점** (산출 방식: {item['weight_info']})")
-                
-                # 어르신이 맘에 드는 일자리 선택 버튼 
-                if st.button(f"👍 이 일자리 마음에 듭니다/지원하기 (JOB: {j['id']})", key=j['id']):
-                    if j['id'] not in st.session_state.db2_preferences:
-                        st.session_state.db2_preferences[j['id']] = {
-                            "exp_tags": senior.get("experiences", []), 
-                            "select_count": 1
-                        }
-                    else:
-                        st.session_state.db2_preferences[j['id']]["select_count"] += 1
+        if not scored_list:
+            st.info("조건에 부합하는 일자리가 없습니다.")
+        else:
+            for rank, item in enumerate(scored_list, 1):
+                j = item["job"]
+                with st.expander(f"✨ [{rank}위] {j['title']} (최종 점수: {item['final_score']:.1f}점)", expanded=True):
+                    st.write(f"- **사업체명**: {j['company_name']} | **사업코드**: `{j['code']}`")
+                    st.write(f"- **a지수 (기타 채용 조건과의 일치도)**: **{item['a_index']:.1f}점** (매칭 판단: `{', '.join(item['matched'])}`)")
+                    st.write(f"- **b지수 (유사 고령자 선호도)**: **{item['b_index']}점** (산출 방식: {item['weight_info']})")
                     
-                    st.success("✅ 선택 내역이 반영되었습니다!")
+                    if st.button(f"👍 이 일자리 마음에 듭니다 (JOB: {j['id']})", key=j['id']):
+                        increment_b_index_in_firestore(j["id"])
+                        st.success("✅ 선택 내역이 반영되었습니다!")
