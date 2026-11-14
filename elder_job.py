@@ -201,7 +201,7 @@ user_role = st.sidebar.radio(
 # [1] 사업주 모드
 # ---------------------------------------------------------
 if user_role == "🏢 사업주 모드":
-    st.header("🏢 사업주 전용 - 일자리 등록 및 관리")
+    st.header("🏢 사업주 전용 - 일자리 등록")
 
     with st.form("employer_form"):
         col1, col2 = st.columns(2)
