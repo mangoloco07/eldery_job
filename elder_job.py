@@ -166,8 +166,30 @@ def get_preferences_from_firestore():
     return {doc.id: doc.to_dict() for doc in docs}
 
 # Groq API 호출 헬퍼
+# Groq API 호출 헬퍼
 def call_groq_safe(client, messages, temperature=0.7, json_mode=False):
-    models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
+    priority_models = [
+        "openai/gpt-oss-120b",
+        "qwen/qwen3.8-27b",
+        "openai/gpt-oss-20b",
+    ]
+    exclude_keywords = ("whisper", "guard", "safeguard", "orpheus", "tts")
+
+    try:
+        available = [
+            m.id for m in client.models.list().data
+            if not any(k in m.id.lower() for k in exclude_keywords)
+        ]
+    except Exception:
+        available = []
+
+    models = [m for m in priority_models if not available or m in available]
+    for m in available:
+        if m not in models:
+            models.append(m)
+    if not models:
+        models = priority_models
+
     last_error = None
     for model_name in models:
         for attempt in range(2):
@@ -183,12 +205,13 @@ def call_groq_safe(client, messages, temperature=0.7, json_mode=False):
                 return response.choices[0].message.content
             except Exception as e:
                 last_error = e
-                if "429" in str(e) or "503" in str(e):
+                err_str = str(e)
+                if "429" in err_str or "503" in err_str:
                     time.sleep(1.5)
                     continue
                 break
     raise last_error
-
+    
 # 기타 채용 조건 일치도 점수 계산 (Groq)
 def calculate_a_index_with_llm(client, senior_exps, job_extras):
     exact_matched = list(set(job_extras).intersection(set(senior_exps)))
