@@ -2,23 +2,42 @@ import streamlit as st
 import pandas as pd
 import json
 import uuid
-from google import genai
-from google.genai import types
+import time
+from openai import OpenAI
 import firebase_admin
 from firebase_admin import credentials, firestore
 
+# 페이지 설정
 st.set_page_config(page_title="노인 일자리 매칭 도움 AI", page_icon="👵👴", layout="wide")
 
-# Firebase/Gemini 연동 
+# Firestore 연동
 if not firebase_admin._apps:
     cred_dict = dict(st.secrets["firebase"])
+    cred_dict["private_key"] = cred_dict["private_key"].replace("\\n", "\n")
     cred = credentials.Certificate(cred_dict)
     firebase_admin.initialize_app(cred)
 
 db = firestore.client()
 
-gemini_api_key = st.secrets["GEMINI_API_KEY"]
-st.sidebar.success("✅ AI 엔진(Gemini) 연결됨")
+# OpenAI api (GPT-4o-mini) 연동 
+st.sidebar.title("🔑 API 설정")
+if "GITHUB_TOKEN" in st.secrets and st.secrets["GITHUB_TOKEN"]:
+    github_token = st.secrets["GITHUB_TOKEN"]
+    st.sidebar.success("✅ AI 엔진(GPT-4o-mini) 연결됨")
+else:
+    github_token = st.sidebar.text_input(
+        "GitHub Token 입력",
+        type="password",
+        help="GitHub Personal Access Token(ghp_...)을 입력하세요."
+    )
+
+def get_gpt_client(token):
+    if not token:
+        return None
+    return OpenAI(
+        base_url="https://models.inference.ai.azure.com",
+        api_key=token,
+    )
 
 # 2026 사업분류코드 및 기본 채용 조건
 LITERACY_CODES = {"B-02", "B-09", "B-12"}
@@ -97,7 +116,7 @@ for code, category, name, desc in RAW_BUSINESS_DATA:
         "is_hours": code in HOURS_CODES
     }
 
-# 4. 세션 초기화 
+# 4. 세션 초기화
 INITIAL_CHAT = [
     {"role": "assistant", "content": "안녕하세요, 어르신! 반갑습니다. 일자리 안내를 도와드릴 스마트 도우미입니다. 편하게 이야기 나누어요."}
 ]
@@ -149,15 +168,37 @@ def get_preferences_from_firestore():
     docs = db.collection("db2_preferences").stream()
     return {doc.id: doc.to_dict() for doc in docs}
 
-# 기타 채용 조건 일치도 점수 계산 (Gemini LLM)
+# GPT-4o-mini 안전 호출 헬퍼
+def call_gpt_safe(client, messages, temperature=0.7, json_mode=False):
+    last_error = None
+    for attempt in range(2):
+        try:
+            kwargs = {
+                "model": "gpt-4o-mini",
+                "messages": messages,
+                "temperature": temperature,
+            }
+            if json_mode:
+                kwargs["response_format"] = {"type": "json_object"}
+            response = client.chat.completions.create(**kwargs)
+            return response.choices[0].message.content
+        except Exception as e:
+            last_error = e
+            if "429" in str(e) or "503" in str(e):
+                time.sleep(2.0)
+                continue
+            raise e
+    raise last_error
+
+# 기타 채용 조건 일치도 점수 계산 (GPT-4o-mini)
 def calculate_a_index_with_llm(client, senior_exps, job_extras):
     exact_matched = list(set(job_extras).intersection(set(senior_exps)))
-    
+
     if not job_extras:
         return 50.0, ["기본 일치"]
     if not senior_exps:
         return 50.0, ["미입력"]
-        
+
     if not client:
         score = min(50 + len(exact_matched) * 25, 100)
         return float(score), exact_matched if exact_matched else ["기본 일치"]
@@ -176,15 +217,16 @@ def calculate_a_index_with_llm(client, senior_exps, job_extras):
             '{"score": 85, "matched_reasons": ["요리 ↔ 조리 (연관 인정)"]}'
         )
 
-        response = client.models.generate_content(
-            model="gemini-3.8-flash",
-            contents=prompt,
-            config=types.GenerateContentConfig(
-                response_mime_type="application/json",
-                temperature=0.0
-            )
+        raw_text = call_gpt_safe(
+            client,
+            messages=[
+                {"role": "system", "content": "You are an HR matching expert that outputs strictly valid JSON."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.0,
+            json_mode=True
         )
-        res = json.loads(response.text)
+        res = json.loads(raw_text)
         return float(res.get("score", 50)), res.get("matched_reasons", exact_matched)
     except Exception:
         score = min(50 + len(exact_matched) * 25, 100)
@@ -193,7 +235,7 @@ def calculate_a_index_with_llm(client, senior_exps, job_extras):
 # 모드 선택
 st.sidebar.divider()
 user_role = st.sidebar.radio(
-    "접속 모드 선택", 
+    "접속 모드 선택",
     ["🏢 사업주 모드", "👵 구직자 모드", "⚙️ 일자리 추천"]
 )
 
@@ -209,8 +251,8 @@ if user_role == "🏢 사업주 모드":
             title = st.text_input("업무명")
             comp_name = st.text_input("사업체(기관)명")
             code_sel = st.selectbox(
-                "2026 사업분류코드 선택", 
-                list(BUSINESS_CODES.keys()), 
+                "2026 사업분류코드 선택",
+                list(BUSINESS_CODES.keys()),
                 format_func=lambda x: f"[{x}] {BUSINESS_CODES[x]['name']} ({BUSINESS_CODES[x]['category']})"
             )
             region = st.text_input("지역 (시/군/구)")
@@ -238,7 +280,7 @@ if user_role == "🏢 사업주 모드":
                 except ValueError:
                     pass
             new_job_id = f"JOB-2026-{max_num + 1:02d}"
-            
+
             new_job = {
                 "id": new_job_id,
                 "company_name": comp_name,
@@ -289,10 +331,10 @@ if user_role == "🏢 사업주 모드":
 elif user_role == "👵 구직자 모드":
     st.header("👵 어르신을 위한 챗봇")
 
-    if not gemini_api_key:
-        st.warning("⚠️ 사이드바에 Gemini API Key를 먼저 입력해 주세요.")
+    if not github_token:
+        st.warning("⚠️ 사이드바에 GitHub Token을 먼저 입력해 주세요.")
     else:
-        client = genai.Client(api_key=gemini_api_key)
+        client = get_gpt_client(github_token)
 
         for msg in st.session_state.chat_history:
             st.chat_message(msg["role"]).write(msg["content"])
@@ -303,30 +345,19 @@ elif user_role == "👵 구직자 모드":
 
             system_prompt = (
                 "당신은 어르신을 모시는 따뜻하고 친절한 노인일자리 안내 챗봇입니다. "
-                "어르신의 (1)거주 지역, (2)글 읽기/쓰기 여부, (3)거동 가능 여부 및 오래 일하기 가능 여부, "
+                "어르신의 (1)거주 지역(시/군/구), (2)글 읽기/쓰기 여부, (3)거동 가능 여부 및 오래 일하기 가능 여부, "
                 "(4)희망 임금 및 시간, (5)과거 직업 경험 및 잘하는 일을 자연스럽게 여쭈어보고 다정하게 호응해 주세요."
             )
 
-            contents = []
-            for msg in st.session_state.chat_history:
-                role = "model" if msg["role"] == "assistant" else "user"
-                contents.append(types.Content(role=role, parts=[types.Part.from_text(text=msg["content"])]))
+            messages = [{"role": "system", "content": system_prompt}] + st.session_state.chat_history
 
             with st.chat_message("assistant"):
                 try:
-                    response = client.models.generate_content(
-                        model="gemini-3.8-flash",
-                        contents=contents,
-                        config=types.GenerateContentConfig(
-                            system_instruction=system_prompt,
-                            temperature=0.7
-                        )
-                    )
-                    bot_reply = response.text
+                    bot_reply = call_gpt_safe(client, messages=messages, temperature=0.7, json_mode=False)
                     st.write(bot_reply)
                     st.session_state.chat_history.append({"role": "assistant", "content": bot_reply})
                 except Exception as e:
-                    st.error(f"⚠️ Gemini API 오류가 발생했습니다: {e}")
+                    st.error(f"⚠️ GPT API 오류가 발생했습니다: {e}")
 
         st.divider()
 
@@ -346,7 +377,7 @@ elif user_role == "👵 구직자 모드":
                     "다음 대화 내역 전체를 분석하여 구직자의 프로필을 JSON 형식으로만 파싱해 주세요.\n"
                     "반드시 JSON 포맷만을 출력해야 합니다. 파악되지 않은 값은 기본값(false 또는 null)을 넣으세요.\n\n"
                     "JSON 키 항목:\n"
-                    "- region_sigungu (string: 시/군/구)\n"
+                    "- region_sigungu (string: 시/군/구, 예: '수원시')\n"
                     "- has_literacy (boolean: 읽기/쓰기 가능 여부)\n"
                     "- can_walking (boolean: 거동 가능 여부, 통증/불편 시 false)\n"
                     "- can_hours (boolean: 장시간 근무 가능 여부)\n"
@@ -357,16 +388,16 @@ elif user_role == "👵 구직자 모드":
                 )
 
                 try:
-                    parse_response = client.models.generate_content(
-                        model="gemini-3.8-flash",
-                        contents=parse_prompt,
-                        config=types.GenerateContentConfig(
-                            response_mime_type="application/json",
-                            temperature=0.0
-                        )
+                    raw_json_str = call_gpt_safe(
+                        client,
+                        messages=[
+                            {"role": "system", "content": "You are a data extraction assistant that outputs strictly valid JSON."},
+                            {"role": "user", "content": parse_prompt}
+                        ],
+                        temperature=0.0,
+                        json_mode=True
                     )
-
-                    parsed_json = json.loads(parse_response.text)
+                    parsed_json = json.loads(raw_json_str)
                     save_senior_profile_to_firestore(parsed_json)
                     st.success("✅ 구직자 프로필이 저장되었습니다.")
                 except Exception as e:
@@ -393,7 +424,7 @@ elif user_role == "⚙️ 일자리 추천":
     elif not db1_jobs:
         st.warning("⚠️ '🏢 사업주 모드' 탭에서 일자리를 먼저 등록해 주세요.")
     else:
-        client = genai.Client(api_key=gemini_api_key) if gemini_api_key else None
+        client = get_gpt_client(github_token)
         db2_prefs = get_preferences_from_firestore()
 
         # [하드필터링]
@@ -422,23 +453,23 @@ elif user_role == "⚙️ 일자리 추천":
         st.divider()
         scored_list = []
 
-        with st.spinner("Firebase DB 데이터와 Gemini LLM을 통해 실시간 분석 중입니다..."):
+        with st.spinner("Firebase DB 데이터와 GPT-4o-mini를 통해 실시간 분석 중입니다..."):
             for j in passed_jobs:
                 job_extras = j.get("extra_conditions", [])
                 senior_exps = senior.get("experiences") or []
-                
+
                 a_index, matched_reasons = calculate_a_index_with_llm(client, senior_exps, job_extras)
 
                 pref_data = db2_prefs.get(j["id"], {"select_count": 0})
                 select_cnt = pref_data.get("select_count", 0)
-                b_index = min(select_cnt * 10, 100)  
+                b_index = min(select_cnt * 10, 100)
 
                 if select_cnt == 0:
-                    final_score = float(a_index) 
-                    weight_info = "a지수 100% (최초)"
+                    final_score = float(a_index)
+                    weight_info = "기타 채용 조건과의 일치도 점수 100% (최초)"
                 else:
-                    final_score = (a_index * 0.6) + (b_index * 0.4)  
-                    weight_info = f"a지수({a_index:.1f}점)*0.6 + b지수({b_index}점)*0.4"
+                    final_score = (a_index * 0.6) + (b_index * 0.4)
+                    weight_info = f"기타 채용 조건과의 일치도 점수({a_index:.1f}점)*0.6 + 유사 고령자의 선호도 점수({b_index}점)*0.4"
 
                 scored_list.append({
                     "job": j,
@@ -452,7 +483,7 @@ elif user_role == "⚙️ 일자리 추천":
         scored_list.sort(key=lambda x: x["final_score"], reverse=True)
 
         st.subheader("🏆 맘에 드는 일자리 순위")
-        
+
         if not scored_list:
             st.info("조건에 부합하는 일자리가 없습니다.")
         else:
@@ -460,9 +491,9 @@ elif user_role == "⚙️ 일자리 추천":
                 j = item["job"]
                 with st.expander(f"✨ [{rank}위] {j['title']} (최종 점수: {item['final_score']:.1f}점)", expanded=True):
                     st.write(f"- **사업체명**: {j['company_name']} | **사업코드**: `{j['code']}`")
-                    st.write(f"- **a지수 (기타 채용 조건과의 일치도)**: **{item['a_index']:.1f}점** (매칭 판단: `{', '.join(item['matched'])}`)")
-                    st.write(f"- **b지수 (유사 고령자 선호도)**: **{item['b_index']}점** (산출 방식: {item['weight_info']})")
-                    
+                    st.write(f"- **기타 채용 조건과의 일치도**: **{item['a_index']:.1f}점** (매칭 판단: `{', '.join(item['matched'])}`)")
+                    st.write(f"- **유사 고령자 선호도**: **{item['b_index']}점** (산출 방식: {item['weight_info']})")
+
                     if st.button(f"👍 이 일자리 마음에 듭니다 (JOB: {j['id']})", key=j['id']):
                         increment_b_index_in_firestore(j["id"])
                         st.success("✅ 선택 내역이 반영되었습니다!")
