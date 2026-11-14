@@ -315,7 +315,7 @@ elif user_role == "👵 구직자 모드":
             with st.chat_message("assistant"):
                 try:
                     response = client.models.generate_content(
-                        model="gemini-2.5-flash",
+                        model="gemini-3.8-flash",
                         contents=contents,
                         config=types.GenerateContentConfig(
                             system_instruction=system_prompt,
@@ -358,7 +358,7 @@ elif user_role == "👵 구직자 모드":
 
                 try:
                     parse_response = client.models.generate_content(
-                        model="gemini-2.5-flash",
+                        model="gemini-3.8-flash",
                         contents=parse_prompt,
                         config=types.GenerateContentConfig(
                             response_mime_type="application/json",
