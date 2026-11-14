@@ -35,8 +35,8 @@ def get_gpt_client(token):
     if not token:
         return None
     return OpenAI(
-        base_url="https://models.inference.ai.azure.com",
-        api_key=token,
+        base_url="https://models.github.ai/inference",
+        api_key=token.strip(),
     )
 
 # 2026 사업분류코드 및 기본 채용 조건
@@ -168,13 +168,12 @@ def get_preferences_from_firestore():
     docs = db.collection("db2_preferences").stream()
     return {doc.id: doc.to_dict() for doc in docs}
 
-# GPT-4o-mini 안전 호출 헬퍼
 def call_gpt_safe(client, messages, temperature=0.7, json_mode=False):
     last_error = None
     for attempt in range(2):
         try:
             kwargs = {
-                "model": "gpt-4o-mini",
+                "model": "openai/gpt-4o-mini",
                 "messages": messages,
                 "temperature": temperature,
             }
@@ -189,7 +188,7 @@ def call_gpt_safe(client, messages, temperature=0.7, json_mode=False):
                 continue
             raise e
     raise last_error
-
+    
 # 기타 채용 조건 일치도 점수 계산 (GPT-4o-mini)
 def calculate_a_index_with_llm(client, senior_exps, job_extras):
     exact_matched = list(set(job_extras).intersection(set(senior_exps)))
