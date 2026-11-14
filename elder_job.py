@@ -3,7 +3,7 @@ import pandas as pd
 import json
 import uuid
 import time
-from openai import OpenAI
+from groq import Groq
 import firebase_admin
 from firebase_admin import credentials, firestore
 
@@ -19,29 +19,22 @@ if not firebase_admin._apps:
 
 db = firestore.client()
 
-# OpenAI api (GPT-4o-mini) 연동 
+# Groq API 연동
 st.sidebar.title("🔑 API 설정")
-if "GITHUB_TOKEN" in st.secrets and st.secrets["GITHUB_TOKEN"]:
-    github_token = st.secrets["GITHUB_TOKEN"]
-    st.sidebar.success("✅ AI 엔진(GPT-4o-mini) 연결됨")
+if "GROQ_API_KEY" in st.secrets and st.secrets["GROQ_API_KEY"]:
+    groq_api_key = st.secrets["GROQ_API_KEY"]
+    st.sidebar.success("✅ AI 엔진(Groq) 연결됨")
 else:
-    github_token = st.sidebar.text_input(
-        "GitHub Token 입력",
+    groq_api_key = st.sidebar.text_input(
+        "Groq API Key 입력",
         type="password",
-        help="GitHub Personal Access Token(ghp_...)을 입력하세요."
+        help="console.groq.com에서 발급받은 API 키(gsk_...)를 입력하세요."
     )
 
-def get_gpt_client(token):
-    if not token:
+def get_groq_client(api_key):
+    if not api_key:
         return None
-    return OpenAI(
-        base_url="https://models.github.ai/inference",
-        api_key=token.strip(),
-        default_headers={
-            "Accept": "application/vnd.github+json",
-            "X-GitHub-Api-Version": "2022-11-28",
-        },
-    )
+    return Groq(api_key=api_key.strip())
 
 # 2026 사업분류코드 및 기본 채용 조건
 LITERACY_CODES = {"B-02", "B-09", "B-12"}
@@ -172,37 +165,31 @@ def get_preferences_from_firestore():
     docs = db.collection("db2_preferences").stream()
     return {doc.id: doc.to_dict() for doc in docs}
 
-# GPT-4o-mini 호출 헬퍼
-def call_gpt_safe(client, messages, temperature=0.7, json_mode=False):
+# Groq API 호출 헬퍼
+def call_groq_safe(client, messages, temperature=0.7, json_mode=False):
+    models = ["llama-3.3-70b-versatile", "llama-3.1-8b-instant"]
     last_error = None
-    for attempt in range(2):
-        try:
-            kwargs = {
-                "model": "openai/gpt-4o-mini",
-                "messages": messages,
-                "temperature": temperature,
-            }
-            if json_mode:
-                kwargs["response_format"] = {"type": "json_object"}
-            response = client.chat.completions.create(**kwargs)
-
-            if isinstance(response, str):
-                try:
-                    data = json.loads(response)
-                    return data["choices"][0]["message"]["content"]
-                except Exception:
-                    raise RuntimeError(f"GitHub 서버 응답 확인 필요: {response[:300]}")
-
-            return response.choices[0].message.content
-        except Exception as e:
-            last_error = e
-            if "429" in str(e) or "503" in str(e):
-                time.sleep(2.0)
-                continue
-            raise e
+    for model_name in models:
+        for attempt in range(2):
+            try:
+                kwargs = {
+                    "model": model_name,
+                    "messages": messages,
+                    "temperature": temperature,
+                }
+                if json_mode:
+                    kwargs["response_format"] = {"type": "json_object"}
+                response = client.chat.completions.create(**kwargs)
+                return response.choices[0].message.content
+            except Exception as e:
+                last_error = e
+                if "429" in str(e) or "503" in str(e):
+                    time.sleep(1.5)
+                    continue
+                break
     raise last_error
-    
-# 기타 채용 조건 일치도 점수 계산 (GPT-4o-mini)
+
+# 기타 채용 조건 일치도 점수 계산 (Groq)
 def calculate_a_index_with_llm(client, senior_exps, job_extras):
     exact_matched = list(set(job_extras).intersection(set(senior_exps)))
 
@@ -229,7 +216,7 @@ def calculate_a_index_with_llm(client, senior_exps, job_extras):
             '{"score": 85, "matched_reasons": ["요리 ↔ 조리 (연관 인정)"]}'
         )
 
-        raw_text = call_gpt_safe(
+        raw_text = call_groq_safe(
             client,
             messages=[
                 {"role": "system", "content": "You are an HR matching expert that outputs strictly valid JSON."},
@@ -343,10 +330,10 @@ if user_role == "🏢 사업주 모드":
 elif user_role == "👵 구직자 모드":
     st.header("👵 어르신을 위한 챗봇")
 
-    if not github_token:
-        st.warning("⚠️ 사이드바에 GitHub Token을 먼저 입력해 주세요.")
+    if not groq_api_key:
+        st.warning("⚠️ 사이드바에 Groq API Key를 먼저 입력해 주세요.")
     else:
-        client = get_gpt_client(github_token)
+        client = get_groq_client(groq_api_key)
 
         for msg in st.session_state.chat_history:
             st.chat_message(msg["role"]).write(msg["content"])
@@ -356,7 +343,7 @@ elif user_role == "👵 구직자 모드":
             st.chat_message("user").write(user_input)
 
             system_prompt = (
-                "당신은 어르신을 모시는 따뜻하고 친절한 노인일자리 안내 챗봇입니다. "
+                "당신은 어르신을 모시는 따뜻하고 친절한 한국어 노인일자리 안내 챗봇입니다. 반드시 자연스럽고 공손한 한국어만 사용하세요. "
                 "어르신의 (1)거주 지역(시/군/구), (2)글 읽기/쓰기 여부, (3)거동 가능 여부 및 오래 일하기 가능 여부, "
                 "(4)희망 임금 및 시간, (5)과거 직업 경험 및 잘하는 일을 자연스럽게 여쭈어보고 다정하게 호응해 주세요."
             )
@@ -365,11 +352,11 @@ elif user_role == "👵 구직자 모드":
 
             with st.chat_message("assistant"):
                 try:
-                    bot_reply = call_gpt_safe(client, messages=messages, temperature=0.7, json_mode=False)
+                    bot_reply = call_groq_safe(client, messages=messages, temperature=0.7, json_mode=False)
                     st.write(bot_reply)
                     st.session_state.chat_history.append({"role": "assistant", "content": bot_reply})
                 except Exception as e:
-                    st.error(f"⚠️ GPT API 오류가 발생했습니다: {e}")
+                    st.error(f"⚠️ Groq API 오류가 발생했습니다: {e}")
 
         st.divider()
 
@@ -400,7 +387,7 @@ elif user_role == "👵 구직자 모드":
                 )
 
                 try:
-                    raw_json_str = call_gpt_safe(
+                    raw_json_str = call_groq_safe(
                         client,
                         messages=[
                             {"role": "system", "content": "You are a data extraction assistant that outputs strictly valid JSON."},
@@ -436,7 +423,7 @@ elif user_role == "⚙️ 일자리 추천":
     elif not db1_jobs:
         st.warning("⚠️ '🏢 사업주 모드' 탭에서 일자리를 먼저 등록해 주세요.")
     else:
-        client = get_gpt_client(github_token)
+        client = get_groq_client(groq_api_key)
         db2_prefs = get_preferences_from_firestore()
 
         # [하드필터링]
@@ -465,7 +452,7 @@ elif user_role == "⚙️ 일자리 추천":
         st.divider()
         scored_list = []
 
-        with st.spinner("Firebase DB 데이터와 GPT-4o-mini를 통해 실시간 분석 중입니다..."):
+        with st.spinner("Firebase DB 데이터와 Groq AI를 통해 실시간 분석 중입니다..."):
             for j in passed_jobs:
                 job_extras = j.get("extra_conditions", [])
                 senior_exps = senior.get("experiences") or []
