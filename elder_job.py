@@ -37,6 +37,10 @@ def get_gpt_client(token):
     return OpenAI(
         base_url="https://models.github.ai/inference",
         api_key=token.strip(),
+        default_headers={
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
     )
 
 # 2026 사업분류코드 및 기본 채용 조건
@@ -168,6 +172,7 @@ def get_preferences_from_firestore():
     docs = db.collection("db2_preferences").stream()
     return {doc.id: doc.to_dict() for doc in docs}
 
+# GPT-4o-mini 호출 헬퍼
 def call_gpt_safe(client, messages, temperature=0.7, json_mode=False):
     last_error = None
     for attempt in range(2):
@@ -180,6 +185,14 @@ def call_gpt_safe(client, messages, temperature=0.7, json_mode=False):
             if json_mode:
                 kwargs["response_format"] = {"type": "json_object"}
             response = client.chat.completions.create(**kwargs)
+
+            if isinstance(response, str):
+                try:
+                    data = json.loads(response)
+                    return data["choices"][0]["message"]["content"]
+                except Exception:
+                    raise RuntimeError(f"GitHub 서버 응답 확인 필요: {response[:300]}")
+
             return response.choices[0].message.content
         except Exception as e:
             last_error = e
